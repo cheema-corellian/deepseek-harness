@@ -1,5 +1,5 @@
 ---
-description: "Web Session-log ZIP export: Host streaming, the authenticated download route, the Session Header action, and the /export command."
+description: "Web Session-log ZIP export and single-file download: Host streaming, the authenticated download routes, the Session Header action, and the /export command."
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-session-log-export` lets the Web interface download a session's full history: a `Download session log` menu item under the Session Header's more-actions button and an `/export` slash command both hand the session tree — the session, its sub-sessions, and attachments — to the browser as a ZIP download. The package owns the Host archive stream, its authenticated Fetch route, and the browser controls and feedback. The browser chooses the download destination. Setup and usage come first; implementation details follow.
+`dsh-session-log-export` lets the Web interface download a session's full history: a `Download session log` menu item under the Session Header's more-actions button and an `/export` slash command both hand the session tree — the session, its sub-sessions, and attachments — to the browser as a ZIP download. The package also owns the single-file route behind Chat file cards: `GET`/`HEAD /api/session/file?sessionId=<id>&attachmentId=<opaque-id>` streams one persisted upload byte-for-byte, authorized by session-log membership. The package owns the Host archive stream, its authenticated Fetch routes, and the browser controls and feedback. The browser chooses the download destination. Setup and usage come first; implementation details follow.
 
 ## Table of Contents
 
@@ -55,11 +55,11 @@ The Web bundle mounts the package with Connection, `dsh-commands`, `dsh-client-u
 
 ### What to expect
 
-The dialog reports three phases: preparing, download started, or failed. Closing the dialog does not cancel an in-flight download, and the dialog does not reopen when that operation later settles. One session admits one active download at a time; repeated gestures share that operation. The export includes the live session's newest events: the host endpoint flushes a live root session before reading, so a slash-triggered ZIP includes the `command/run` and `command/done` pair that started the download; cold persisted sessions need no flush. Each logical log uses the current generation's canonical filename inside the archive (`session.jsonl` for v0, otherwise `session.vN.jsonl`), including beneath each sub-session directory. Images use `media/<attachmentId>.<ext>`, and generic files use `files/<digest-prefix>/<digest>/<name>`. Generic-file bytes are read and compressed as bounded chunks, so exporting a large upload does not buffer it in full.
+The dialog reports three phases: preparing, download started, or failed. Closing the dialog does not cancel an in-flight download, and the dialog does not reopen when that operation later settles. One session admits one active download at a time; repeated gestures share that operation. The export includes the live session's newest events: the host endpoint flushes a live root session before reading, so a slash-triggered ZIP includes the `command/run` and `command/done` pair that started the download; cold persisted sessions need no flush. Each logical log uses the current generation's canonical filename inside the archive (`session.jsonl` for v0, otherwise `session.vN.jsonl`), including beneath each sub-session directory. Images use `media/<attachmentId>.<ext>`, and generic files use `files/<digest-prefix>/<digest>/<name>`. Generic-file bytes are read and compressed as bounded chunks, so exporting a large upload does not buffer it in full. Durable Chat file cards link to the single-file route with the owning session id and the opaque attachment id; the stored reference owns the filename, media type, and byte length, the query values never become paths, and submission echoes keep the plain card until the reference is durable.
 
 ### Failures
 
-The dialog shows a preparation error when the preflight fails before ZIP streaming starts — for example an unreachable or misconfigured host endpoint. A descendant or attachment read failure after the browser accepts the GET is reported by the browser download manager, not by the dialog.
+The dialog shows a preparation error when the preflight fails before ZIP streaming starts — for example an unreachable or misconfigured host endpoint. A descendant or attachment read failure after the browser accepts the GET is reported by the browser download manager, not by the dialog. The single-file route answers `400` for a malformed query, `404` for an unknown session or an attachment the session log never names, and `500` without host paths when the stored log cannot be read; a mid-stream storage failure errors the download rather than shipping truncated bytes.
 
 -----
 
@@ -73,7 +73,7 @@ This section explains how the package wires the export control and points at the
 
 ### Design split
 
-The package has two halves. The Host half ([`src/index.ts`](src/index.ts)) registers the `/export` command and contributes the exact `GET`/`HEAD /api/session.export` Fetch route to Connection; [`src/archive.ts`](src/archive.ts) builds the bounded ZIP stream. The browser half ([`src/client/index.ts`](src/client/index.ts)) provides the shared download controller and UI, and observes `command/executed` so only the submitting browser starts a download.
+The package has two halves. The Host half ([`src/index.ts`](src/index.ts)) registers the `/export` command and contributes the exact `GET`/`HEAD /api/session.export` and `GET`/`HEAD /api/session/file` Fetch routes to Connection; [`src/archive.ts`](src/archive.ts) builds the bounded ZIP stream and owns the shared attachment-reference collector plus the single-file filename, disposition, and media-type helpers. The browser half ([`src/client/index.ts`](src/client/index.ts)) provides the shared download controller and UI, and observes `command/executed` so only the submitting browser starts a download.
 
 ### Download flow
 

@@ -354,6 +354,21 @@
   box-sizing: border-box;
 }
 
+/* Durable file cards are download anchors with identical layout. */
+a.fileCard {
+  color: inherit;
+  text-decoration: none;
+}
+
+a.fileCard:hover {
+  border-color: var(--dsw-alias-border-l2-hover, rgba(0, 0, 0, 0.2));
+}
+
+a.fileCard:focus-visible {
+  outline: 1.5px solid var(--dsw-alias-button-info-fill);
+  outline-offset: 2px;
+}
+
 .fileIcon {
   flex: none;
   width: 28px;

@@ -9,6 +9,9 @@ import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import {
   DEFAULT_SESSION_LOG_COMPRESSION_LEVEL,
+  fileDownloadDisposition,
+  fileDownloadMediaType,
+  findFileAttachmentInArtifact,
   flushLiveSessionLog,
   readSessionLogText,
   sessionLogExportDeps,
@@ -19,9 +22,14 @@ import {
 } from './archive.ts'
 
 export {
+  attachmentRefsInArtifact,
   DEFAULT_SESSION_LOG_COMPRESSION_LEVEL,
+  fileDownloadDisposition,
+  fileDownloadMediaType,
+  findFileAttachmentInArtifact,
   flushLiveSessionLog,
   readSessionLogText,
+  safeFileDownloadName,
   serializeSessionLog,
   SESSION_LOG_FILENAME,
   sessionLogExportDeps,
@@ -41,6 +49,13 @@ export const inject = ['commands', 'connection']
 
 /** Stable browser download path retained across the transport migration. */
 export const SESSION_LOG_EXPORT_PATH = '/api/session.export'
+
+/**
+ * Stable browser path for one persisted session-owned file download. The query
+ * carries opaque `sessionId` plus `attachmentId`; the stored session log is
+ * the only authority and the stored reference owns filename, media, and bytes.
+ */
+export const SESSION_FILE_PATH = '/api/session/file'
 
 /** Session-log archive policy. */
 export interface Config {
@@ -71,7 +86,8 @@ const REQUESTED: CommandResult = {
 }
 
 /**
- * Register the Web-only `/export` command and authenticated ZIP download route.
+ * Register the Web-only `/export` command, the authenticated ZIP download
+ * route, and the authenticated single-file download route.
  * @param ctx - Host context carrying the human-command registry.
  * @param config - resolved compression policy.
  */
@@ -94,6 +110,17 @@ export function apply(ctx: Context, config: Config = {}): void {
         request,
         config.compressionLevel ?? DEFAULT_SESSION_LOG_COMPRESSION_LEVEL,
       )
+      if (request.method === 'GET') return response
+      await response.body?.cancel()
+      return new Response(null, { status: response.status, headers: response.headers })
+    },
+  })
+  connectionOf(ctx).fetch.register({
+    path: SESSION_FILE_PATH,
+    methods: ['GET', 'HEAD'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      const response = await sessionFileResponse(ctx, request)
       if (request.method === 'GET') return response
       await response.body?.cancel()
       return new Response(null, { status: response.status, headers: response.headers })
@@ -166,4 +193,112 @@ async function sessionLogExportResponse(
     },
   )
   return response
+}
+
+const SESSION_FILE_BASE_HEADERS = {
+  'cache-control': 'private, no-store',
+  'x-content-type-options': 'nosniff',
+  'content-security-policy': "sandbox; default-src 'none'",
+} as const
+
+/**
+ * Answer one authenticated single-file download from persisted session
+ * membership. The stored log must name the opaque attachment id; the stored
+ * reference owns filename, media type, and byte length. Query values never
+ * become paths and host paths never reach the browser.
+ * @param ctx - Host context carrying export services.
+ * @param request - authenticated GET/HEAD request with sessionId+attachmentId.
+ * @returns exact file bytes with a safe attachment disposition, or 400/404/500.
+ */
+async function sessionFileResponse(ctx: Context, request: Request): Promise<Response> {
+  const url = new URL(request.url)
+  const sessionIds = url.searchParams.getAll('sessionId')
+  const attachmentIds = url.searchParams.getAll('attachmentId')
+  if (sessionIds.length !== 1 || attachmentIds.length !== 1) {
+    return new Response('missing or invalid session file query parameters', {
+      status: 400,
+      headers: { ...SESSION_FILE_BASE_HEADERS },
+    })
+  }
+  const sessionIdValue = sessionIds[0] as string
+  const attachmentIdValue = attachmentIds[0] as string
+  if (sessionIdValue.length === 0 || attachmentIdValue.length === 0) {
+    return new Response('missing or invalid session file query parameters', {
+      status: 400,
+      headers: { ...SESSION_FILE_BASE_HEADERS },
+    })
+  }
+  const sessionId = brandString<SessionId>(sessionIdValue)
+  const deps = sessionLogExportDeps(ctx)
+  if (deps.sessionPersistence === undefined || deps.attachments === undefined) {
+    return new Response(
+      'session file download is unavailable: missing session-persistence or attachments service',
+      { status: 500, headers: { ...SESSION_FILE_BASE_HEADERS } },
+    )
+  }
+  let rootContent: string | undefined
+  try {
+    await flushLiveSessionLog(deps, sessionId, request.signal)
+    rootContent = await readSessionLogText(deps.sessionPersistence, sessionId, request.signal)
+    request.signal.throwIfAborted()
+  } catch {
+    request.signal.throwIfAborted()
+    return new Response('session file download failed to read the stored log', {
+      status: 500,
+      headers: { ...SESSION_FILE_BASE_HEADERS },
+    })
+  }
+  if (rootContent === undefined) {
+    return new Response('session not found', {
+      status: 404,
+      headers: { ...SESSION_FILE_BASE_HEADERS },
+    })
+  }
+  const ref = findFileAttachmentInArtifact(rootContent, attachmentIdValue)
+  if (ref === undefined) {
+    return new Response('attachment is not referenced by this session', {
+      status: 404,
+      headers: { ...SESSION_FILE_BASE_HEADERS },
+    })
+  }
+  const headers: Record<string, string> = {
+    ...SESSION_FILE_BASE_HEADERS,
+    'content-type': fileDownloadMediaType(ref),
+    'content-disposition': fileDownloadDisposition(ref),
+    'content-length': String(ref.bytes),
+  }
+  if (request.method === 'HEAD') return new Response(null, { status: 200, headers })
+  const chunks = deps.attachments.readFileStream(ref, request.signal)
+  return new Response(fileChunkStream(chunks, request.signal), { status: 200, headers })
+}
+
+/**
+ * Bridge one bounded attachment chunk iteration into a WHATWG byte stream.
+ * Empty chunks are skipped; a storage or integrity failure errors the stream
+ * rather than shipping truncated bytes.
+ * @param chunks - exact file bytes in order from the attachment store.
+ * @param signal - request cancellation combined with consumer cancellation.
+ * @returns the file byte stream.
+ */
+function fileChunkStream(
+  chunks: AsyncIterable<Uint8Array>,
+  signal: AbortSignal,
+): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for await (const chunk of chunks) {
+          signal.throwIfAborted()
+          if (chunk.byteLength === 0) continue
+          controller.enqueue(chunk.slice())
+        }
+        controller.close()
+      } catch (error) {
+        controller.error(error instanceof Error ? error : new Error(String(error)))
+      }
+    },
+    cancel() {
+      // Request signal owns cancellation; consumer cancel drops the reader.
+    },
+  })
 }
