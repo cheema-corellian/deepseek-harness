@@ -153,10 +153,28 @@ function TurnMaxTokensItem({ t }: {
   )
 }
 
+/**
+ * Browser path for one persisted session-owned file download. Mirrors
+ * `SESSION_FILE_PATH` in `@deepseek-ai/dsh-session-log-export` without a
+ * client dependency; the Host route owns session membership authority.
+ */
+export const SESSION_FILE_DOWNLOAD_PATH = '/api/session/file'
+
+/**
+ * One same-origin download URL for a durable file reference. Session
+ * membership is proven Host-side; the query carries opaque identities only.
+ * @param sessionId - viewed Session owning the reference.
+ * @param attachmentId - opaque attachment identity from the stored reference.
+ * @returns the binary download URL.
+ */
+export function sessionFileHref(sessionId: string, attachmentId: string): string {
+  return `${SESSION_FILE_DOWNLOAD_PATH}?sessionId=${encodeURIComponent(sessionId)}&attachmentId=${encodeURIComponent(attachmentId)}`
+}
+
 /** Right-aligned bubble shared by user and steering rows. */
 function UserStyleBubble({
   content, renderMessageImages, actions, pending = false, echo = false, referenceLabels = [], skillNames = [],
-  previewAttachments, references, t,
+  previewAttachments, references, fileHref, t,
 }: {
   content: readonly unknown[]
   renderMessageImages: ChatNodeOwnerProps['renderMessageImages']
@@ -173,6 +191,8 @@ function UserStyleBubble({
   /** Local submission-echo attachments replacing the content-derived attachment sequence. */
   previewAttachments?: readonly PresentedAttachment[]
   references?: Pick<ChatNodeOwnerProps, 'openFile' | 'openSkill'>
+  /** Download URL for one durable file; absent renders the plain card (echo/preview). */
+  fileHref?: (file: UserFile['attachment']) => string | undefined
   t: ChatViewSlotProps['t']
 }): ReactNode {
   const { text, attachments: contentAttachments, rest } = contentParts(content)
@@ -199,18 +219,32 @@ function UserStyleBubble({
                   })}
                 </Fragment>
               )
-              : (
-                <span key={`file:${index}`} className={css.fileCard} title={attachment.file.name}>
-                  <FileTypeIcon path={attachment.file.name} className={css.fileIcon} />
-                  <span className={css.fileContent}>
-                    <span className={css.fileName}>{attachment.file.name}</span>
-                    <span className={css.fileMeta}>
-                      {[fileExtension(attachment.file.name).toUpperCase().slice(0, 8), fileSizeText(attachment.file.bytes)]
-                        .filter(Boolean).join(' ')}
+              : (() => {
+                const href = fileHref?.(attachment.file)
+                const body = (
+                  <Fragment>
+                    <FileTypeIcon path={attachment.file.name} className={css.fileIcon} />
+                    <span className={css.fileContent}>
+                      <span className={css.fileName}>{attachment.file.name}</span>
+                      <span className={css.fileMeta}>
+                        {[fileExtension(attachment.file.name).toUpperCase().slice(0, 8), fileSizeText(attachment.file.bytes)]
+                          .filter(Boolean).join(' ')}
+                      </span>
                     </span>
-                  </span>
-                </span>
-              ))}
+                  </Fragment>
+                )
+                return href === undefined
+                  ? (
+                    <span key={`file:${index}`} className={css.fileCard} title={attachment.file.name}>
+                      {body}
+                    </span>
+                  )
+                  : (
+                    <a key={`file:${index}`} className={css.fileCard} title={attachment.file.name} href={href}>
+                      {body}
+                    </a>
+                  )
+              })())}
           </div>
         )}
         {showBubble && <div className={css.bubble}>
@@ -313,9 +347,14 @@ export function PendingSubmissionBubble({ submission, renderMessageImages, t }: 
 
 /** User and admitted-steering keyed Chat renderer. */
 export const UserMessageNodeView = memo(function UserMessageNodeView({
-  node, renderMessageImages, openFile, openSkill, t,
+  node, renderMessageImages, openFile, openSkill, sessionId, t,
 }: ChatNodeViewProps<'user' | 'steering'>) {
   const data = node.data
+  const ownedSessionId = sessionId as string | undefined
+  const fileHref = ownedSessionId === undefined
+    ? undefined
+    : (file: UserFile['attachment']): string =>
+      sessionFileHref(ownedSessionId, String(file.attachmentId))
   return (
     <UserStyleBubble
       content={data.content}
@@ -323,6 +362,7 @@ export const UserMessageNodeView = memo(function UserMessageNodeView({
       renderMessageImages={renderMessageImages}
       {...data.referenceLabels === undefined ? {} : { referenceLabels: data.referenceLabels }}
       {...data.skillNames === undefined ? {} : { skillNames: data.skillNames }}
+      {...fileHref === undefined ? {} : { fileHref }}
       t={t}
       actions={text => (
         <MessageIconActions

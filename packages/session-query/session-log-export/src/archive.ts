@@ -270,7 +270,7 @@ function collectEventAttachmentRefs(
  * @param content - the stored artifact text.
  * @returns image and file dedupe maps.
  */
-function attachmentRefsInArtifact(content: string): {
+export function attachmentRefsInArtifact(content: string): {
   readonly images: Map<string, ImageAttachmentRef>
   readonly files: Map<string, FileAttachmentRef>
 } {
@@ -287,6 +287,104 @@ function attachmentRefsInArtifact(content: string): {
     collectEventAttachmentRefs(event, images, files)
   }
   return { images, files }
+}
+
+/**
+ * Find one verbatim file reference proven reachable from a stored session log.
+ * Membership in the log is the only authority; the content hash alone never
+ * authorizes a read. The first reference with the opaque attachment id wins;
+ * distinct display names for one digest keep the first stored reference.
+ * @param content - the already-serialized stored session log text.
+ * @param attachmentId - opaque attachment identity from the query string.
+ * @returns the stored file reference, or undefined when the log never names it.
+ */
+export function findFileAttachmentInArtifact(
+  content: string,
+  attachmentId: string,
+): FileAttachmentRef | undefined {
+  const { files } = attachmentRefsInArtifact(content)
+  for (const ref of files.values()) {
+    if (String(ref.attachmentId) === attachmentId) return ref
+  }
+  return undefined
+}
+
+/**
+ * One safe download filename derived from a stored file reference. The stored
+ * name is already a sanitized leaf, but separators, quotes, and controls are
+ * neutralized again before the value shapes a Content-Disposition header. The
+ * result may still contain non-ASCII characters; it is the source for the RFC
+ * 5987 extended parameter, not a directly header-safe quoted value.
+ * @param ref - the durable file reference from the session log.
+ * @returns a non-empty sanitized leaf (possibly non-ASCII).
+ */
+export function safeFileDownloadName(ref: FileAttachmentRef): string {
+  const name = ref.name.replace(/["\\/\u0000-\u001f\u007f]/gu, '_')
+  return name === '' || name === '.' || name === '..' ? 'file' : name
+}
+
+/**
+ * Percent-encode one sanitized filename for the RFC 5987 `filename*`
+ * parameter. `encodeURIComponent` alone leaves `'`, `(`, `)`, and `*`
+ * unescaped, which the extended-value `attr-char` set forbids, so those four
+ * are percent-encoded explicitly. Encoding a `%` that is already present is
+ * intended: the stored name is raw text, never pre-encoded.
+ * @param value - the sanitized leaf from `safeFileDownloadName`.
+ * @returns the UTF-8 percent-encoded extended value.
+ */
+function encodeRFC5987Filename(value: string): string {
+  return encodeURIComponent(value).replace(/['()*]/gu, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+}
+
+/**
+ * One ASCII fallback for the quoted `filename` parameter. Non-ASCII
+ * printable characters collapse to `_` so the quoted value stays a valid
+ * header ByteString; the original spelling survives in `filename*`. The input
+ * is already non-empty and never `.`/`..` (from `safeFileDownloadName`), and
+ * the replacement preserves length, so the output keeps those properties.
+ * @param safe - the sanitized leaf from `safeFileDownloadName`.
+ * @returns a non-empty printable-ASCII filename.
+ */
+function asciiFileDownloadFallback(safe: string): string {
+  return safe.replace(/[^\x20-\x7E]/gu, '_').replace(/["\\]/gu, '_')
+}
+
+/**
+ * One safe Content-Disposition value for a stored file reference. The quoted
+ * `filename` carries an ASCII fallback so `new Response` never receives a
+ * non-ByteString header value; the RFC 5987 part preserves the UTF-8 leaf.
+ * @param ref - the durable file reference from the session log.
+ * @returns the attachment disposition header value.
+ */
+export function fileDownloadDisposition(ref: FileAttachmentRef): string {
+  const safe = safeFileDownloadName(ref)
+  const fallback = asciiFileDownloadFallback(safe)
+  const quoted = fallback.replace(/\\/gu, '\\\\').replace(/"/gu, '\\"')
+  return `attachment; filename="${quoted}"; filename*=UTF-8''${encodeRFC5987Filename(safe)}`
+}
+
+/**
+ * One response media type derived from a stored file reference name. Known
+ * text and document extensions keep a specific type; anything else stays
+ * `application/octet-stream` so the browser never sniffs bytes as HTML.
+ * @param ref - the durable file reference from the session log.
+ * @returns the Content-Type header value.
+ */
+export function fileDownloadMediaType(ref: FileAttachmentRef): string {
+  const dot = ref.name.lastIndexOf('.')
+  const extension = dot < 0 ? '' : ref.name.slice(dot + 1).toLowerCase()
+  switch (extension) {
+    case 'txt': return 'text/plain; charset=utf-8'
+    case 'md': case 'markdown': return 'text/markdown; charset=utf-8'
+    case 'csv': return 'text/csv; charset=utf-8'
+    case 'json': case 'jsonl': return 'application/json'
+    case 'pdf': return 'application/pdf'
+    case 'png': return 'image/png'
+    case 'jpg': case 'jpeg': return 'image/jpeg'
+    case 'gif': return 'image/gif'
+    case 'webp': return 'image/webp'
+    default: return 'application/octet-stream'
+  }
 }
 
 /**
