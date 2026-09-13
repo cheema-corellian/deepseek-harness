@@ -268,37 +268,82 @@ async function sessionFileResponse(ctx: Context, request: Request): Promise<Resp
     'content-length': String(ref.bytes),
   }
   if (request.method === 'HEAD') return new Response(null, { status: 200, headers })
-  const chunks = deps.attachments.readFileStream(ref, request.signal)
-  return new Response(fileChunkStream(chunks, request.signal), { status: 200, headers })
+  const attachments = deps.attachments
+  return new Response(
+    fileChunkStream(signal => attachments.readFileStream(ref, signal), request.signal),
+    { status: 200, headers },
+  )
 }
 
 /**
- * Bridge one bounded attachment chunk iteration into a WHATWG byte stream.
- * Empty chunks are skipped; a storage or integrity failure errors the stream
- * rather than shipping truncated bytes.
- * @param chunks - exact file bytes in order from the attachment store.
- * @param signal - request cancellation combined with consumer cancellation.
+ * Bridge one bounded attachment chunk iteration into a WHATWG byte stream
+ * without eager draining. The provider iteration opens on the first consumer
+ * pull, so an unread consumer produces no chunks; each pull reads at most one
+ * chunk, so a slow consumer bounds accumulation to the stream queue. An
+ * operation-owned signal combines request cancellation with consumer
+ * cancellation and is the signal the provider observes; consumer cancel also
+ * closes the active iterator so a pending storage read is released. Empty
+ * chunks are skipped; a storage or integrity failure errors the stream rather
+ * than shipping truncated bytes.
+ * @param openChunks - opens the exact file bytes for one producer signal.
+ * @param requestSignal - request cancellation combined with consumer cancellation.
  * @returns the file byte stream.
  */
 function fileChunkStream(
-  chunks: AsyncIterable<Uint8Array>,
-  signal: AbortSignal,
+  openChunks: (signal: AbortSignal) => AsyncIterable<Uint8Array>,
+  requestSignal: AbortSignal,
 ): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
+  const consumerAbort = new AbortController()
+  const producerSignal = AbortSignal.any([requestSignal, consumerAbort.signal])
+  let iterator: AsyncIterator<Uint8Array> | undefined
+  const closeIterator = async (): Promise<void> => {
+    const active = iterator
+    iterator = undefined
+    /* v8 ignore next 3 -- cleanup is best-effort; providers without return or
+       with failing return are defensive and never observed in tests */
+    if (active?.return !== undefined) {
       try {
-        for await (const chunk of chunks) {
-          signal.throwIfAborted()
+        await active.return()
+      } catch {
+        // The stream already carries the terminal state.
+      }
+    }
+  }
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        producerSignal.throwIfAborted()
+        iterator ??= openChunks(producerSignal)[Symbol.asyncIterator]()
+        while (true) {
+          const next = await iterator.next()
+          producerSignal.throwIfAborted()
+          if (next.done === true) {
+            try {
+              controller.close()
+            } catch {
+              // The consumer already settled the stream.
+            }
+            return
+          }
+          const chunk = next.value
           if (chunk.byteLength === 0) continue
           controller.enqueue(chunk.slice())
+          return
         }
-        controller.close()
       } catch (error) {
-        controller.error(error instanceof Error ? error : new Error(String(error)))
+        await closeIterator()
+        try {
+          controller.error(error instanceof Error ? error : new Error(String(error)))
+        } catch {
+          // The consumer already settled the stream.
+        }
       }
     },
-    cancel() {
-      // Request signal owns cancellation; consumer cancel drops the reader.
+    async cancel(reason) {
+      consumerAbort.abort(
+        reason instanceof Error ? reason : new Error('session file stream cancelled'),
+      )
+      await closeIterator()
     },
   })
 }

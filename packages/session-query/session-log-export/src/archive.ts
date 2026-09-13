@@ -312,9 +312,11 @@ export function findFileAttachmentInArtifact(
 /**
  * One safe download filename derived from a stored file reference. The stored
  * name is already a sanitized leaf, but separators, quotes, and controls are
- * neutralized again before the value shapes a Content-Disposition header.
+ * neutralized again before the value shapes a Content-Disposition header. The
+ * result may still contain non-ASCII characters; it is the source for the RFC
+ * 5987 extended parameter, not a directly header-safe quoted value.
  * @param ref - the durable file reference from the session log.
- * @returns a non-empty filename safe to quote in a header.
+ * @returns a non-empty sanitized leaf (possibly non-ASCII).
  */
 export function safeFileDownloadName(ref: FileAttachmentRef): string {
   const name = ref.name.replace(/["\\/\u0000-\u001f\u007f]/gu, '_')
@@ -322,15 +324,43 @@ export function safeFileDownloadName(ref: FileAttachmentRef): string {
 }
 
 /**
+ * Percent-encode one sanitized filename for the RFC 5987 `filename*`
+ * parameter. `encodeURIComponent` alone leaves `'`, `(`, `)`, and `*`
+ * unescaped, which the extended-value `attr-char` set forbids, so those four
+ * are percent-encoded explicitly. Encoding a `%` that is already present is
+ * intended: the stored name is raw text, never pre-encoded.
+ * @param value - the sanitized leaf from `safeFileDownloadName`.
+ * @returns the UTF-8 percent-encoded extended value.
+ */
+function encodeRFC5987Filename(value: string): string {
+  return encodeURIComponent(value).replace(/['()*]/gu, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+}
+
+/**
+ * One ASCII fallback for the quoted `filename` parameter. Non-ASCII
+ * printable characters collapse to `_` so the quoted value stays a valid
+ * header ByteString; the original spelling survives in `filename*`. The input
+ * is already non-empty and never `.`/`..` (from `safeFileDownloadName`), and
+ * the replacement preserves length, so the output keeps those properties.
+ * @param safe - the sanitized leaf from `safeFileDownloadName`.
+ * @returns a non-empty printable-ASCII filename.
+ */
+function asciiFileDownloadFallback(safe: string): string {
+  return safe.replace(/[^\x20-\x7E]/gu, '_').replace(/["\\]/gu, '_')
+}
+
+/**
  * One safe Content-Disposition value for a stored file reference. The quoted
- * filename carries the sanitized leaf; the RFC 5987 part preserves UTF-8.
+ * `filename` carries an ASCII fallback so `new Response` never receives a
+ * non-ByteString header value; the RFC 5987 part preserves the UTF-8 leaf.
  * @param ref - the durable file reference from the session log.
  * @returns the attachment disposition header value.
  */
 export function fileDownloadDisposition(ref: FileAttachmentRef): string {
   const safe = safeFileDownloadName(ref)
-  const quoted = safe.replace(/\\/gu, '\\\\').replace(/"/gu, '\\"')
-  return `attachment; filename="${quoted}"; filename*=UTF-8''${encodeURIComponent(safe)}`
+  const fallback = asciiFileDownloadFallback(safe)
+  const quoted = fallback.replace(/\\/gu, '\\\\').replace(/"/gu, '\\"')
+  return `attachment; filename="${quoted}"; filename*=UTF-8''${encodeRFC5987Filename(safe)}`
 }
 
 /**
