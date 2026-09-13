@@ -143,6 +143,170 @@ describe('session/file download endpoint', () => {
     expect(streamed).toBe(false)
   })
 
+  it('serves a non-Latin filename through GET with exact bytes and decodable extended filename', async () => {
+    const digest = 'e'.repeat(64)
+    const id = `sha256:${digest}`
+    const name = '报告.txt'
+    const bytes = Uint8Array.of(1, 2, 3)
+    const api = await buildFileApi({ 'session-a': log('session-a', [fileEvent(id, name, 3)]) }, {
+      readFileStream: ref => (async function* (): AsyncIterable<Uint8Array> {
+        expect(ref.name).toBe(name)
+        yield bytes
+      })(),
+    })
+    const response = await api.fetch(new Request(fileUrl('session-a', id)))
+    expect(response.status).toBe(200)
+    const disposition = response.headers.get('content-disposition') ?? ''
+    expect(/^[\x20-\x7E]*$/.test(disposition)).toBe(true)
+    expect(disposition).toContain('attachment; filename="__.txt"')
+    expect(disposition).not.toMatch(/报告/)
+    const extended = disposition.split("filename*=UTF-8''")[1] ?? ''
+    expect(extended.length).toBeGreaterThan(0)
+    expect(decodeURIComponent(extended)).toBe(name)
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes)
+  })
+
+  it('preflights a non-Latin filename through HEAD without opening file bytes', async () => {
+    const digest = 'f'.repeat(64)
+    const id = `sha256:${digest}`
+    const name = '报告.txt'
+    let streamed = false
+    const api = await buildFileApi({ 'session-a': log('session-a', [fileEvent(id, name, 3)]) }, {
+      readFileStream: () => (async function* (): AsyncIterable<Uint8Array> {
+        streamed = true
+        yield Uint8Array.of(1, 2, 3)
+      })(),
+    })
+    const response = await api.fetch(new Request(fileUrl('session-a', id), { method: 'HEAD' }))
+    expect(response.status).toBe(200)
+    const disposition = response.headers.get('content-disposition') ?? ''
+    expect(/^[\x20-\x7E]*$/.test(disposition)).toBe(true)
+    expect(disposition).toContain('filename="__.txt"')
+    const extended = disposition.split("filename*=UTF-8''")[1] ?? ''
+    expect(decodeURIComponent(extended)).toBe(name)
+    expect(response.headers.get('content-length')).toBe('3')
+    expect(response.body).toBeNull()
+    expect(streamed).toBe(false)
+  })
+
+  it('sanitizes quote, control, and path characters in actual GET and HEAD responses', async () => {
+    const cases: Array<[string, string]> = [
+      ['a"b.txt', 'a_b.txt'],
+      ['a\\b.txt', 'a_b.txt'],
+      ['a/b.txt', 'a_b.txt'],
+      ['a\x01b.txt', 'a_b.txt'],
+      ['.', 'file'],
+      ['..', 'file'],
+    ]
+    for (const [index, [stored, safe]] of cases.entries()) {
+      const digest = `${index}`.repeat(64).slice(0, 64)
+      const id = `sha256:${digest}`
+      const api = await buildFileApi({ 'session-a': log('session-a', [fileEvent(id, stored, 1)]) }, {
+        readFileStream: () => (async function* (): AsyncIterable<Uint8Array> {
+          yield Uint8Array.of(7)
+        })(),
+      })
+      const getResponse = await api.fetch(new Request(fileUrl('session-a', id)))
+      expect(getResponse.status).toBe(200)
+      const getDisposition = getResponse.headers.get('content-disposition') ?? ''
+      expect(/^[\x20-\x7E]*$/.test(getDisposition)).toBe(true)
+      expect(getDisposition).toContain(`filename="${safe}"`)
+      const getExtended = getDisposition.split("filename*=UTF-8''")[1] ?? ''
+      expect(decodeURIComponent(getExtended)).toBe(safe)
+      expect(new Uint8Array(await getResponse.arrayBuffer())).toEqual(Uint8Array.of(7))
+
+      const headApi = await buildFileApi({ 'session-a': log('session-a', [fileEvent(id, stored, 1)]) })
+      const headResponse = await headApi.fetch(new Request(fileUrl('session-a', id), { method: 'HEAD' }))
+      expect(headResponse.status).toBe(200)
+      const headDisposition = headResponse.headers.get('content-disposition') ?? ''
+      expect(/^[\x20-\x7E]*$/.test(headDisposition)).toBe(true)
+      expect(headDisposition).toContain(`filename="${safe}"`)
+    }
+  })
+
+  it('percent-encodes extended-value punctuation per RFC 5987 in the actual response', async () => {
+    const digest = '9'.repeat(64)
+    const id = `sha256:${digest}`
+    const name = "a'b(c)*d.txt"
+    const api = await buildFileApi({ 'session-a': log('session-a', [fileEvent(id, name, 1)]) }, {
+      readFileStream: () => (async function* (): AsyncIterable<Uint8Array> {
+        yield Uint8Array.of(7)
+      })(),
+    })
+    const response = await api.fetch(new Request(fileUrl('session-a', id)))
+    expect(response.status).toBe(200)
+    const disposition = response.headers.get('content-disposition') ?? ''
+    expect(/^[\x20-\x7E]*$/.test(disposition)).toBe(true)
+    expect(disposition).toContain(`filename="${name}"`)
+    const extended = disposition.split("filename*=UTF-8''")[1] ?? ''
+    expect(extended).not.toMatch(/['()*]/)
+    expect(extended).toContain('%27')
+    expect(extended).toContain('%28')
+    expect(extended).toContain('%29')
+    expect(extended).toContain('%2A')
+    expect(decodeURIComponent(extended)).toBe(name)
+    await response.arrayBuffer()
+  })
+
+  it('bounds production for an unread slow consumer', async () => {
+    const digest = '1'.repeat(64)
+    const id = `sha256:${digest}`
+    let produced = 0
+    const total = 100
+    const api = await buildFileApi({ 'session-a': log('session-a', [fileEvent(id, 'big.bin', total)]) }, {
+      readFileStream: () => (async function* (): AsyncIterable<Uint8Array> {
+        for (let index = 0; index < total; index += 1) {
+          produced += 1
+          yield Uint8Array.of(index & 0xff)
+        }
+      })(),
+    })
+    const response = await api.fetch(new Request(fileUrl('session-a', id)))
+    expect(response.status).toBe(200)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(produced).toBeLessThan(total)
+    expect(produced).toBeLessThanOrEqual(2)
+    await response.body?.cancel()
+  })
+
+  it('cancels an active provider read and releases its iterator', async () => {
+    const digest = '2'.repeat(64)
+    const id = `sha256:${digest}`
+    let openedSignal: AbortSignal | undefined
+    let cleaned = false
+    const api = await buildFileApi({ 'session-a': log('session-a', [fileEvent(id, 'notes.txt', 2)]) }, {
+      readFileStream: (_ref, signal) => (async function* (): AsyncIterable<Uint8Array> {
+        openedSignal = signal
+        try {
+          yield Uint8Array.of(9, 9)
+          await new Promise<void>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => { reject(new Error('provider aborted')) }, { once: true })
+          })
+          yield Uint8Array.of(8)
+        } finally {
+          cleaned = true
+        }
+      })(),
+    })
+    const response = await api.fetch(new Request(fileUrl('session-a', id)))
+    expect(response.status).toBe(200)
+    const reader = response.body?.getReader()
+    expect(reader).toBeDefined()
+    const first = await reader?.read()
+    expect(first?.done).toBe(false)
+    expect(first?.value).toEqual(Uint8Array.of(9, 9))
+    expect(openedSignal).toBeInstanceOf(AbortSignal)
+    expect(openedSignal?.aborted).toBe(false)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(cleaned).toBe(false)
+    await reader?.cancel(new Error('consumer gone'))
+    for (let attempt = 0; attempt < 50 && !cleaned; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    expect(cleaned).toBe(true)
+    expect(openedSignal?.aborted).toBe(true)
+  })
+
   it('denies a foreign attachment and a wrong session with 404', async () => {
     const digest = 'c'.repeat(64)
     const id = `sha256:${digest}`
